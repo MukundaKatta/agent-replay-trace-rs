@@ -41,7 +41,10 @@ use std::path::Path;
 pub enum ReplayError {
     Io(std::io::Error),
     /// A JSONL line could not be parsed as a JSON object.
-    Decode { line: usize, message: String },
+    Decode {
+        line: usize,
+        message: String,
+    },
 }
 
 impl std::fmt::Display for ReplayError {
@@ -90,9 +93,9 @@ impl Replay {
         let f = std::fs::File::open(path.as_ref())?;
         let reader = BufReader::new(f);
         let mut events = Vec::new();
-        let mut lineno = 0usize;
-        for raw in reader.lines() {
-            lineno += 1;
+        for (idx, raw) in reader.lines().enumerate() {
+            // 1-based line number for human-friendly error messages.
+            let lineno = idx + 1;
             let line = raw?;
             if line.trim().is_empty() {
                 continue;
@@ -137,7 +140,9 @@ impl Replay {
     pub fn slice(&self, start: usize, end: usize) -> Replay {
         let end = end.min(self.events.len());
         let start = start.min(end);
-        Replay { events: self.events[start..end].to_vec() }
+        Replay {
+            events: self.events[start..end].to_vec(),
+        }
     }
 
     // ---- filtering -------------------------------------------------------
@@ -145,7 +150,12 @@ impl Replay {
     /// Return a new `Replay` containing only events matching `predicate`.
     pub fn filter(&self, predicate: impl Fn(&Value) -> bool) -> Replay {
         Replay {
-            events: self.events.iter().filter(|e| predicate(e)).cloned().collect(),
+            events: self
+                .events
+                .iter()
+                .filter(|e| predicate(e))
+                .cloned()
+                .collect(),
         }
     }
 
@@ -227,6 +237,40 @@ impl Replay {
             .count()
     }
 
+    /// Collect the value at `key` for every event that has it, preserving
+    /// order. Events missing the key are skipped.
+    ///
+    /// Useful for extracting a single "column" from a trace, e.g. all
+    /// `tool_name` values or all timestamps.
+    pub fn pluck(&self, key: &str) -> Vec<&Value> {
+        self.events.iter().filter_map(|ev| ev.get(key)).collect()
+    }
+
+    /// The set of distinct values seen at `key`, sorted for stable output.
+    /// Values are compared by their canonical JSON string form, so this works
+    /// for strings, numbers, and other JSON scalars alike.
+    pub fn distinct(&self, key: &str) -> Vec<Value> {
+        let mut seen: HashMap<String, Value> = HashMap::new();
+        for ev in &self.events {
+            if let Some(v) = ev.get(key) {
+                seen.entry(v.to_string()).or_insert_with(|| v.clone());
+            }
+        }
+        let mut out: Vec<Value> = seen.into_values().collect();
+        out.sort_by_key(|a| a.to_string());
+        out
+    }
+
+    /// Index of the first event matching all `(key, value)` equality filters,
+    /// or `None` if there is no match.
+    pub fn index_of(&self, filters: &[(&str, Value)]) -> Option<usize> {
+        self.events.iter().position(|ev| {
+            ev.as_object()
+                .map(|obj| filters.iter().all(|(k, v)| obj.get(*k) == Some(v)))
+                .unwrap_or(false)
+        })
+    }
+
     // ---- step-through ----------------------------------------------------
 
     pub fn debugger(&self) -> Debugger {
@@ -278,6 +322,11 @@ impl Debugger {
     }
 
     /// Advance one step. Returns the new current event, or `None` at end.
+    ///
+    /// This borrows the cursor and returns a reference into it, which is the
+    /// natural shape for a step-through debugger. The owned-value
+    /// [`Iterator`] impl (`for ev in debugger`) is provided separately.
+    #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Option<&Value> {
         let next = self.pos + 1;
         if next >= self.events.len() as i64 {
@@ -301,6 +350,17 @@ impl Debugger {
     /// Reset cursor to before the first event.
     pub fn reset(&mut self) {
         self.pos = -1;
+    }
+
+    /// Jump the cursor directly to `idx` and return the event there.
+    /// Returns `None` (and leaves the cursor unchanged) if `idx` is out of
+    /// bounds.
+    pub fn seek(&mut self, idx: usize) -> Option<&Value> {
+        if idx >= self.events.len() {
+            return None;
+        }
+        self.pos = idx as i64;
+        self.events.get(idx)
     }
 
     /// Look at the next `window` events without advancing the cursor.
@@ -372,7 +432,10 @@ mod tests {
     fn iter() {
         let r = sample();
         let kinds: Vec<_> = r.iter().map(|e| e["kind"].as_str().unwrap()).collect();
-        assert_eq!(kinds, ["tool_called", "tool_returned", "tool_called", "errored"]);
+        assert_eq!(
+            kinds,
+            ["tool_called", "tool_returned", "tool_called", "errored"]
+        );
     }
 
     #[test]
@@ -478,13 +541,70 @@ mod tests {
     }
 
     #[test]
+    fn pluck_extracts_column() {
+        let r = sample();
+        let names: Vec<_> = r
+            .pluck("tool_name")
+            .into_iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        // Only the three events that carry `tool_name` should appear.
+        assert_eq!(names, ["search", "search", "read"]);
+    }
+
+    #[test]
+    fn pluck_missing_key_is_empty() {
+        let r = sample();
+        assert!(r.pluck("no_such_key").is_empty());
+    }
+
+    #[test]
+    fn distinct_values_sorted() {
+        let r = sample();
+        let kinds = r.distinct("kind");
+        assert_eq!(
+            kinds,
+            vec![
+                json!("errored"),
+                json!("tool_called"),
+                json!("tool_returned")
+            ]
+        );
+    }
+
+    #[test]
+    fn distinct_dedupes_and_handles_numbers() {
+        let r = Replay::new(vec![
+            json!({"n": 2}),
+            json!({"n": 1}),
+            json!({"n": 2}),
+            json!({"other": 5}),
+        ]);
+        assert_eq!(r.distinct("n"), vec![json!(1), json!(2)]);
+    }
+
+    #[test]
+    fn index_of_finds_first_match() {
+        let r = sample();
+        assert_eq!(r.index_of(&[("kind", json!("tool_called"))]), Some(0));
+        assert_eq!(r.index_of(&[("kind", json!("errored"))]), Some(3));
+    }
+
+    #[test]
+    fn index_of_no_match() {
+        let r = sample();
+        assert!(r.index_of(&[("kind", json!("nope"))]).is_none());
+    }
+
+    #[test]
     fn from_jsonl_roundtrip() {
         let dir = std::env::temp_dir();
         let path = dir.join("replay_test.jsonl");
         std::fs::write(
             &path,
             "{\"kind\":\"tool_called\",\"ts\":1.0}\n\n{\"kind\":\"errored\"}\n",
-        ).unwrap();
+        )
+        .unwrap();
         let r = Replay::from_jsonl(&path).unwrap();
         assert_eq!(r.len(), 2);
         std::fs::remove_file(&path).ok();
@@ -564,6 +684,28 @@ mod tests {
         d.next();
         d.reset();
         assert_eq!(d.position(), -1);
+    }
+
+    #[test]
+    fn debugger_seek() {
+        let r = sample();
+        let mut d = r.debugger();
+        let ev = d.seek(2).unwrap();
+        assert_eq!(ev["kind"], json!("tool_called"));
+        assert_eq!(d.position(), 2);
+        // Continuing from the seeked position should move to index 3.
+        let nxt = d.next().unwrap();
+        assert_eq!(nxt["kind"], json!("errored"));
+    }
+
+    #[test]
+    fn debugger_seek_out_of_bounds() {
+        let r = sample();
+        let mut d = r.debugger();
+        d.next(); // position 0
+        assert!(d.seek(99).is_none());
+        // Cursor must be unchanged on a failed seek.
+        assert_eq!(d.position(), 0);
     }
 
     #[test]
