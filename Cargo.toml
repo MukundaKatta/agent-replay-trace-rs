@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Load and step through JSONL agent traces"
 license = "MIT"
+readme = "README.md"
 repository = "https://github.com/MukundaKatta/agent-replay-trace-rs"
 keywords = ["agent", "trace", "replay", "llm", "debug"]
 categories = ["development-tools::debugging"]
